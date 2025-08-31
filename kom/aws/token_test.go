@@ -97,10 +97,6 @@ func TestTokenManager_IsUsingSDK(t *testing.T) {
 	if !tm.IsUsingSDK() {
 		t.Errorf("Expected TokenManager to be using SDK mode")
 	}
-
-	if tm.IsUsingExec() {
-		t.Errorf("Expected TokenManager not to be using Exec mode")
-	}
 }
 
 func TestTokenManager_GetProviderInfo(t *testing.T) {

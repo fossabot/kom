@@ -2,10 +2,8 @@ package aws
 
 import (
 	"context"
-	"fmt"
 	"time"
 
-	"k8s.io/client-go/tools/clientcmd/api"
 	"k8s.io/klog/v2"
 )
 
@@ -102,27 +100,4 @@ func (ap *AuthProvider) SetTokenManager(manager *TokenManager) {
 	ap.tokenManager = manager
 }
 
-func (ap *AuthProvider) SetEKSExecProvider(provider *api.ExecConfig) error {
-	if ap.eksConfig == nil {
-		return fmt.Errorf("请先配置EKS 信息")
-	}
 
-	// 将 []api.ExecEnvVar 转换为 map[string]string
-	envMap := make(map[string]string)
-	for _, env := range provider.Env {
-		envMap[env.Name] = env.Value
-	}
-
-	config := &ExecConfig{
-		Command:         provider.Command,
-		Args:            provider.Args,
-		Env:             envMap,
-		AccessKey:       ap.eksConfig.AccessKey,
-		SecretAccessKey: ap.eksConfig.SecretAccessKey,
-		Region:          ap.eksConfig.Region,
-		RoleARN:         ap.eksConfig.RoleARN,
-		SessionName:     ap.eksConfig.SessionName,
-	}
-	ap.eksConfig.ExecConfig = config
-	return nil
-}

@@ -12,7 +12,7 @@ import (
 	"k8s.io/klog/v2"
 )
 
-// TokenManager Token管理器 - 支持SDK和Exec两种模式
+// TokenManager Token管理器 - 只支持SDK模式
 type TokenManager struct {
 	eksConfig *EKSAuthConfig
 	awsConfig aws.Config
@@ -20,9 +20,6 @@ type TokenManager struct {
 	
 	// Token提供者 (SDK模式)
 	tokenProvider TokenProvider
-	
-	// 向下兼容 (Exec模式)
-	executor *ExecExecutor
 	
 	// 并发控制
 	refreshMutex    sync.RWMutex
@@ -91,15 +88,8 @@ func (tm *TokenManager) initTokenProvider() error {
 		return nil
 	}
 
-	// 回退到Exec配置（向下兼容）
-	if tm.eksConfig.ExecConfig != nil {
-		klog.Warning("Using deprecated exec-based token provider, consider migrating to SDK mode")
-		tm.executor = NewExecExecutor()
-		return nil
-	}
-
 	return NewEKSAuthError(ErrorTypeAWSConfigMissing, 
-		"no valid token provider configuration found (SDK or Exec)", nil)
+		"no valid SDK configuration found, please provide either SDKConfig or basic AWS credentials", nil)
 }
 
 // GetValidToken 获取有效的token
@@ -126,42 +116,28 @@ func (tm *TokenManager) refreshToken(ctx context.Context) (string, error) {
 		return token, nil
 	}
 
-	var tokenResponse *TokenResponse
-	var err error
-
-	// 使用SDK提供者或Exec提供者
+	// 使用SDK提供者
 	if tm.tokenProvider != nil {
-		// SDK模式
-		tokenResponse, err = tm.tokenProvider.GetTokenWithRetry(ctx, 2)
+		tokenResponse, err := tm.tokenProvider.GetTokenWithRetry(ctx, 2)
 		if err != nil {
 			return "", fmt.Errorf("SDK token provider failed: %w", err)
 		}
-	} else if tm.executor != nil {
-		// Exec模式（向下兼容）
-		if err := tm.executor.ValidateCommand(tm.eksConfig.ExecConfig); err != nil {
-			return "", err
-		}
 		
-		tokenResponse, err = tm.executor.GetTokenWithRetry(ctx, tm.eksConfig.ExecConfig, 2)
-		if err != nil {
-			return "", fmt.Errorf("Exec token provider failed: %w", err)
+		// 初始化TokenCache如果不存在
+		if tm.eksConfig.TokenCache == nil {
+			tm.eksConfig.TokenCache = &TokenCache{}
 		}
-	} else {
-		return "", NewEKSAuthError(ErrorTypeAWSConfigMissing, "no token provider available", nil)
+
+		// 更新缓存
+		tm.eksConfig.TokenCache.SetToken(tokenResponse.Status.Token, tokenResponse.Status.ExpirationTimestamp)
+
+		klog.V(2).Infof("Successfully refreshed AWS token, expires at: %v",
+			tokenResponse.Status.ExpirationTimestamp)
+
+		return tokenResponse.Status.Token, nil
 	}
-
-	// 初始化TokenCache如果不存在
-	if tm.eksConfig.TokenCache == nil {
-		tm.eksConfig.TokenCache = &TokenCache{}
-	}
-
-	// 更新缓存
-	tm.eksConfig.TokenCache.SetToken(tokenResponse.Status.Token, tokenResponse.Status.ExpirationTimestamp)
-
-	klog.V(2).Infof("Successfully refreshed AWS token, expires at: %v",
-		tokenResponse.Status.ExpirationTimestamp)
-
-	return tokenResponse.Status.Token, nil
+	
+	return "", NewEKSAuthError(ErrorTypeAWSConfigMissing, "no token provider available", nil)
 }
 
 // RefreshToken 公共方法刷新token
@@ -250,18 +226,7 @@ func (tm *TokenManager) ValidateAWSCredentials(ctx context.Context) error {
 		return tm.tokenProvider.ValidateCluster(ctx)
 	}
 
-	// Exec模式：使用STS客户端验证
-	if tm.stsClient == nil {
-		return NewEKSAuthError(ErrorTypeAWSConfigMissing, "STS client not initialized", nil)
-	}
-
-	_, err := tm.stsClient.GetCallerIdentity(ctx, &sts.GetCallerIdentityInput{})
-	if err != nil {
-		return NewEKSAuthError(ErrorTypePermissionDenied, "AWS credentials validation failed", err)
-	}
-
-	klog.V(2).Infof("AWS credentials validated successfully")
-	return nil
+	return NewEKSAuthError(ErrorTypeAWSConfigMissing, "no token provider available for validation", nil)
 }
 
 // GetCallerIdentity 获取当前AWS身份信息
@@ -327,18 +292,12 @@ func (tm *TokenManager) IsUsingSDK() bool {
 	return tm.tokenProvider != nil
 }
 
-// IsUsingExec 检查是否使用Exec模式
-func (tm *TokenManager) IsUsingExec() bool {
-	return tm.executor != nil
-}
+
 
 // GetProviderInfo 获取提供者信息
 func (tm *TokenManager) GetProviderInfo() string {
 	if tm.tokenProvider != nil {
 		return fmt.Sprintf("SDK: %s", tm.tokenProvider.String())
-	}
-	if tm.executor != nil {
-		return "Exec: AWS CLI"
 	}
 	return "None"
 }

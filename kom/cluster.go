@@ -173,12 +173,8 @@ func (c *ClusterInstances) RegisterByConfigWithID(config *rest.Config, id string
 		}
 	}
 
-	// 检查是否需要 exec 认证处理 (AWS EKS 或其他 exec 模式)
+	// 检查是否需要AWS EKS认证处理
 	if cluster != nil && cluster.IsEKS {
-		err := cluster.AWSAuthProvider.SetEKSExecProvider(config.ExecProvider)
-		if err != nil {
-			return nil, err
-		}
 		// 获取初始 token
 		ctx := context.Background()
 		token, _, err := cluster.AWSAuthProvider.GetToken(ctx)
@@ -186,7 +182,6 @@ func (c *ClusterInstances) RegisterByConfigWithID(config *rest.Config, id string
 			return nil, fmt.Errorf("failed to get initial AWS token: %w", err)
 		}
 		config.BearerToken = token
-
 	}
 	// key 不存在，进行初始化
 	k := initKubectl(config, id)
