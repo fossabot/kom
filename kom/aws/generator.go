@@ -1,7 +1,9 @@
 package aws
 
 import (
+	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"fmt"
 	"io/ioutil"
 	"os"
@@ -10,6 +12,13 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/service/eks"
+	sts "github.com/aws/aws-sdk-go-v2/service/sts"
+	clientcmd "k8s.io/client-go/tools/clientcmd"
+	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 	"k8s.io/klog/v2"
 )
 
@@ -54,6 +63,10 @@ func (kg *KubeconfigGenerator) GenerateFromAWS(config *EKSAuthConfig) (string, e
 	if err := kg.executeAWSCommandWithEnv(config, envVars); err != nil {
 		return "", err
 	}
+
+	// if err = kg.GenerateEKSKubeconfig(config, kubeconfigPath); err != nil {
+	// 	return "", err
+	// }
 
 	// 验证生成的kubeconfig文件
 	if err := kg.validateKubeconfig(kubeconfigPath); err != nil {
@@ -164,6 +177,86 @@ func (kg *KubeconfigGenerator) executeAWSCommandWithEnv(config *EKSAuthConfig, e
 	}
 
 	return lastErr
+}
+
+// GenerateEKSKubeconfig 生成 kubeconfig 并保存
+func (kg *KubeconfigGenerator) GenerateEKSKubeconfig(ac *EKSAuthConfig, kubeconfigPath string) error {
+	ctx := context.TODO()
+
+	awsCfg, err := config.LoadDefaultConfig(ctx,
+		config.WithRegion(ac.Region),
+		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(ac.AccessKey, ac.SecretAccessKey, ac.SessionName)),
+	)
+	if err != nil {
+		return fmt.Errorf("加载 AWS 配置失败: %w", err)
+	}
+
+	eksClient := eks.NewFromConfig(awsCfg)
+
+	// 获取 cluster 信息
+	clusterOutput, err := eksClient.DescribeCluster(ctx, &eks.DescribeClusterInput{
+		Name: &ac.ClusterName,
+	})
+	if err != nil {
+		return fmt.Errorf("DescribeCluster 失败: %w", err)
+	}
+	cluster := clusterOutput.Cluster
+
+	// 生成 EKS token
+	token, err := generateEKSToken(ctx, awsCfg, ac.Region, ac.ClusterName)
+	if err != nil {
+		return fmt.Errorf("生成 EKS token 失败: %w", err)
+	}
+
+	// 构建 kubeconfig
+	kubeconfig := clientcmdapi.NewConfig()
+
+	// 解码证书数据
+	var certData []byte
+	if cluster.CertificateAuthority != nil && cluster.CertificateAuthority.Data != nil {
+		certData, err = base64.StdEncoding.DecodeString(*cluster.CertificateAuthority.Data)
+		if err != nil {
+			return fmt.Errorf("解码证书数据失败: %w", err)
+		}
+	}
+
+	kubeconfig.Clusters["eks"] = &clientcmdapi.Cluster{
+		Server:                   *cluster.Endpoint,
+		CertificateAuthorityData: certData,
+	}
+	kubeconfig.AuthInfos["aws"] = &clientcmdapi.AuthInfo{
+		Token: token,
+	}
+	kubeconfig.Contexts["eks"] = &clientcmdapi.Context{
+		Cluster:  "eks",
+		AuthInfo: "aws",
+	}
+	kubeconfig.CurrentContext = "eks"
+
+	// 写入文件
+	err = clientcmd.WriteToFile(*kubeconfig, kubeconfigPath)
+	if err != nil {
+		return fmt.Errorf("写入 kubeconfig 失败: %w", err)
+	}
+
+	return nil
+}
+
+// generateEKSToken 生成 EKS IAM token
+func generateEKSToken(ctx context.Context, cfg aws.Config, region, clusterName string) (string, error) {
+
+	// STS 客户端
+	stsSvc := sts.NewFromConfig(cfg)
+	presignClient := sts.NewPresignClient(stsSvc)
+
+	// 生成预签名 URL
+	presigned, err := presignClient.PresignGetCallerIdentity(ctx, &sts.GetCallerIdentityInput{})
+	if err != nil {
+		return "", err
+	}
+	// Base64 URL 编码，拼成 EKS token
+	token := "k8s-aws-v1." + base64.RawURLEncoding.EncodeToString([]byte(presigned.URL))
+	return token, nil
 }
 
 // validateKubeconfig 验证生成的kubeconfig文件
