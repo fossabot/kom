@@ -1,6 +1,7 @@
 package aws
 
 import (
+	"context"
 	"crypto/rand"
 	"fmt"
 	"io/ioutil"
@@ -29,11 +30,57 @@ func NewKubeconfigGenerator() *KubeconfigGenerator {
 	}
 }
 
-// GenerateFromAWS 通过AWS CLI生成kubeconfig
+// GenerateFromAWS 通过AWS生成kubeconfig (支持SDK和CLI两种模式)
 func (kg *KubeconfigGenerator) GenerateFromAWS(config *EKSAuthConfig) (string, error) {
 	if err := kg.validateConfig(config); err != nil {
 		return "", err
 	}
+
+	// 优先使用SDK模式
+	if config.IsUsingSDK() {
+		return kg.generateWithSDK(config)
+	}
+	
+	// 尝试从基本配置构建SDK模式
+	if config.AccessKey != "" && config.SecretAccessKey != "" &&
+		config.Region != "" && config.ClusterName != "" {
+		return kg.generateWithSDK(config)
+	}
+
+	// 回退到CLI模式（向下兼容）
+	klog.Warning("Using deprecated AWS CLI mode, consider migrating to SDK mode for better performance")
+	return kg.generateWithCLI(config)
+}
+
+// generateWithSDK 使用AWS SDK生成kubeconfig
+func (kg *KubeconfigGenerator) generateWithSDK(config *EKSAuthConfig) (string, error) {
+	// 构建或获取SDK配置
+	sdkConfig, err := config.BuildSDKConfig()
+	if err != nil {
+		return "", NewEKSAuthError(ErrorTypeSDKInitialization, "failed to build SDK config", err)
+	}
+
+	// 创建SDK生成器
+	sdkGenerator, err := NewSDKKubeconfigGenerator(sdkConfig)
+	if err != nil {
+		return "", NewEKSAuthError(ErrorTypeSDKInitialization, "failed to create SDK generator", err)
+	}
+
+	// 生成kubeconfig
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	kubeconfigContent, err := sdkGenerator.GenerateKubeconfig(ctx)
+	if err != nil {
+		return "", fmt.Errorf("SDK kubeconfig generation failed: %w", err)
+	}
+
+	klog.V(2).Infof("Generated kubeconfig using SDK for cluster: %s", config.ClusterName)
+	return kubeconfigContent, nil
+}
+
+// generateWithCLI 使用AWS CLI生成kubeconfig (向下兼容)
+func (kg *KubeconfigGenerator) generateWithCLI(config *EKSAuthConfig) (string, error) {
 
 	// 生成临时kubeconfig文件路径
 	kubeconfigPath, err := kg.generateTempKubeconfigPath(config.ClusterName)

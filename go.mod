@@ -3,6 +3,10 @@ module github.com/weibaohui/kom
 go 1.24.0
 
 require (
+	github.com/aws/aws-sdk-go-v2 v1.25.0
+	github.com/aws/aws-sdk-go-v2/config v1.25.9
+	github.com/aws/aws-sdk-go-v2/service/eks v1.35.0
+	github.com/aws/aws-sdk-go-v2/service/sts v1.26.0
 	github.com/dgraph-io/ristretto/v2 v2.2.0
 	github.com/duke-git/lancet/v2 v2.3.7
 	github.com/fatih/camelcase v1.0.0
@@ -22,19 +26,15 @@ require (
 
 require (
 	github.com/Azure/go-ansiterm v0.0.0-20230124172434-306776ec8161 // indirect
-	github.com/aws/aws-sdk-go-v2 v1.25.0 // indirect
-	github.com/aws/aws-sdk-go-v2/config v1.25.9 // indirect
 	github.com/aws/aws-sdk-go-v2/credentials v1.16.7 // indirect
 	github.com/aws/aws-sdk-go-v2/feature/ec2/imds v1.14.10 // indirect
 	github.com/aws/aws-sdk-go-v2/internal/configsources v1.2.9 // indirect
 	github.com/aws/aws-sdk-go-v2/internal/endpoints/v2 v2.5.9 // indirect
 	github.com/aws/aws-sdk-go-v2/internal/ini v1.7.1 // indirect
-	github.com/aws/aws-sdk-go-v2/service/eks v1.35.0 // indirect
 	github.com/aws/aws-sdk-go-v2/service/internal/accept-encoding v1.10.4 // indirect
 	github.com/aws/aws-sdk-go-v2/service/internal/presigned-url v1.10.9 // indirect
 	github.com/aws/aws-sdk-go-v2/service/sso v1.18.4 // indirect
 	github.com/aws/aws-sdk-go-v2/service/ssooidc v1.21.4 // indirect
-	github.com/aws/aws-sdk-go-v2/service/sts v1.26.0 // indirect
 	github.com/aws/smithy-go v1.20.0 // indirect
 	github.com/blang/semver/v4 v4.0.0 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect

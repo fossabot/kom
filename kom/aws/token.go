@@ -3,6 +3,7 @@ package aws
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -11,17 +12,27 @@ import (
 	"k8s.io/klog/v2"
 )
 
-// TokenManager AWS token 管理器
+// TokenManager Token管理器 - 支持SDK和Exec两种模式
 type TokenManager struct {
-	eksConfig   *EKSAuthConfig
-	executor    *ExecExecutor
-	awsConfig   aws.Config
-	stsClient   *sts.Client
-	refreshChan chan struct{}
-	stopChan    chan struct{}
+	eksConfig *EKSAuthConfig
+	awsConfig aws.Config
+	stsClient *sts.Client
+	
+	// Token提供者 (SDK模式)
+	tokenProvider TokenProvider
+	
+	// 向下兼容 (Exec模式)
+	executor *ExecExecutor
+	
+	// 并发控制
+	refreshMutex    sync.RWMutex
+	autoRefreshCtx  context.Context
+	autoRefreshStop context.CancelFunc
+	refreshChan     chan struct{}
+	stopChan        chan struct{}
 }
 
-// NewTokenManager 创建新的 token 管理器
+// NewTokenManager 创建新的token管理器
 func NewTokenManager(eksConfig *EKSAuthConfig) (*TokenManager, error) {
 	if eksConfig == nil {
 		return nil, NewEKSAuthError(ErrorTypeAWSConfigMissing, "EKS config is required", nil)
@@ -29,12 +40,16 @@ func NewTokenManager(eksConfig *EKSAuthConfig) (*TokenManager, error) {
 
 	tm := &TokenManager{
 		eksConfig:   eksConfig,
-		executor:    NewExecExecutor(),
 		refreshChan: make(chan struct{}, 1),
 		stopChan:    make(chan struct{}),
 	}
 
-	// 初始化 AWS 配置
+	// 初始化Token提供者
+	if err := tm.initTokenProvider(); err != nil {
+		return nil, err
+	}
+
+	// 初始化AWS配置
 	if err := tm.initAWSConfig(context.Background()); err != nil {
 		return nil, err
 	}
@@ -42,36 +57,55 @@ func NewTokenManager(eksConfig *EKSAuthConfig) (*TokenManager, error) {
 	return tm, nil
 }
 
-// initAWSConfig 初始化 AWS 配置
-func (tm *TokenManager) initAWSConfig(ctx context.Context) error {
-	var opts []func(*config.LoadOptions) error
-
-	// 设置区域
-	if tm.eksConfig.Region != "" {
-		opts = append(opts, config.WithRegion(tm.eksConfig.Region))
+// initTokenProvider 初始化Token提供者
+func (tm *TokenManager) initTokenProvider() error {
+	// 优先使用SDK配置
+	if tm.eksConfig.SDKConfig != nil {
+		tokenProvider, err := NewEKSTokenProvider(tm.eksConfig.SDKConfig)
+		if err != nil {
+			return fmt.Errorf("failed to create EKS token provider: %w", err)
+		}
+		tm.tokenProvider = tokenProvider
+		klog.V(2).Infof("Using SDK token provider: %s", tokenProvider.String())
+		return nil
 	}
- 
-	awsConfig, err := config.LoadDefaultConfig(ctx, opts...)
-	if err != nil {
-		return NewEKSAuthError(ErrorTypeAWSConfigMissing, "failed to load AWS config", err)
+	
+	// 如果没有SDK配置，尝试从基本配置构建
+	if tm.eksConfig.AccessKey != "" && tm.eksConfig.SecretAccessKey != "" &&
+		tm.eksConfig.Region != "" && tm.eksConfig.ClusterName != "" {
+		
+		klog.V(2).Infof("Building SDK config from basic auth config")
+		
+		sdkConfig, err := tm.eksConfig.BuildSDKConfig()
+		if err != nil {
+			return fmt.Errorf("failed to build SDK config: %w", err)
+		}
+		
+		tokenProvider, err := NewEKSTokenProvider(sdkConfig)
+		if err != nil {
+			return fmt.Errorf("failed to create EKS token provider: %w", err)
+		}
+		
+		tm.tokenProvider = tokenProvider
+		klog.V(2).Infof("Using SDK token provider: %s", tokenProvider.String())
+		return nil
 	}
 
-	tm.awsConfig = awsConfig
-	tm.stsClient = sts.NewFromConfig(awsConfig)
+	// 回退到Exec配置（向下兼容）
+	if tm.eksConfig.ExecConfig != nil {
+		klog.Warning("Using deprecated exec-based token provider, consider migrating to SDK mode")
+		tm.executor = NewExecExecutor()
+		return nil
+	}
 
-	// 保存到 EKS 配置中
-	tm.eksConfig.AWSConfig = &awsConfig
-
-	klog.V(2).Infof("Initialized AWS config with region: %s",
-		awsConfig.Region)
-
-	return nil
+	return NewEKSAuthError(ErrorTypeAWSConfigMissing, 
+		"no valid token provider configuration found (SDK or Exec)", nil)
 }
 
-// GetValidToken 获取有效的 token
+// GetValidToken 获取有效的token
 func (tm *TokenManager) GetValidToken(ctx context.Context) (string, error) {
-	// 检查缓存中的 token 是否有效
-	if tm.eksConfig.TokenCache.IsValid() {
+	// 检查缓存中的token是否有效
+	if tm.eksConfig.TokenCache != nil && tm.eksConfig.TokenCache.IsValid() {
 		token, _ := tm.eksConfig.TokenCache.GetToken()
 		klog.V(4).Infof("Using cached AWS token")
 		return token, nil
@@ -81,17 +115,44 @@ func (tm *TokenManager) GetValidToken(ctx context.Context) (string, error) {
 	return tm.refreshToken(ctx)
 }
 
-// refreshToken 刷新 token
+// refreshToken 刷新token
 func (tm *TokenManager) refreshToken(ctx context.Context) (string, error) {
-	// 验证 exec 配置
-	if err := tm.executor.ValidateCommand(tm.eksConfig.ExecConfig); err != nil {
-		return "", err
+	tm.refreshMutex.Lock()
+	defer tm.refreshMutex.Unlock()
+
+	// 双重检查 - 在获取锁期间可能已经刷新了
+	if tm.eksConfig.TokenCache != nil && tm.eksConfig.TokenCache.IsValid() {
+		token, _ := tm.eksConfig.TokenCache.GetToken()
+		return token, nil
 	}
 
-	// 执行 AWS CLI 命令获取 token
-	tokenResponse, err := tm.executor.GetTokenWithRetry(ctx, tm.eksConfig.ExecConfig, 2)
-	if err != nil {
-		return "", err
+	var tokenResponse *TokenResponse
+	var err error
+
+	// 使用SDK提供者或Exec提供者
+	if tm.tokenProvider != nil {
+		// SDK模式
+		tokenResponse, err = tm.tokenProvider.GetTokenWithRetry(ctx, 2)
+		if err != nil {
+			return "", fmt.Errorf("SDK token provider failed: %w", err)
+		}
+	} else if tm.executor != nil {
+		// Exec模式（向下兼容）
+		if err := tm.executor.ValidateCommand(tm.eksConfig.ExecConfig); err != nil {
+			return "", err
+		}
+		
+		tokenResponse, err = tm.executor.GetTokenWithRetry(ctx, tm.eksConfig.ExecConfig, 2)
+		if err != nil {
+			return "", fmt.Errorf("Exec token provider failed: %w", err)
+		}
+	} else {
+		return "", NewEKSAuthError(ErrorTypeAWSConfigMissing, "no token provider available", nil)
+	}
+
+	// 初始化TokenCache如果不存在
+	if tm.eksConfig.TokenCache == nil {
+		tm.eksConfig.TokenCache = &TokenCache{}
 	}
 
 	// 更新缓存
@@ -103,7 +164,7 @@ func (tm *TokenManager) refreshToken(ctx context.Context) (string, error) {
 	return tokenResponse.Status.Token, nil
 }
 
-// RefreshToken 公共方法刷新 token
+// RefreshToken 公共方法刷新token
 func (tm *TokenManager) RefreshToken(ctx context.Context) error {
 	_, err := tm.refreshToken(ctx)
 	return err
@@ -111,7 +172,8 @@ func (tm *TokenManager) RefreshToken(ctx context.Context) error {
 
 // StartAutoRefresh 启动自动刷新机制
 func (tm *TokenManager) StartAutoRefresh(ctx context.Context) {
-	go tm.autoRefreshLoop(ctx)
+	tm.autoRefreshCtx, tm.autoRefreshStop = context.WithCancel(ctx)
+	go tm.autoRefreshLoop(tm.autoRefreshCtx)
 }
 
 // autoRefreshLoop 自动刷新循环
@@ -136,11 +198,15 @@ func (tm *TokenManager) autoRefreshLoop(ctx context.Context) {
 	}
 }
 
-// checkAndRefreshToken 检查并刷新 token
+// checkAndRefreshToken 检查并刷新token
 func (tm *TokenManager) checkAndRefreshToken(ctx context.Context) {
+	if tm.eksConfig.TokenCache == nil {
+		return
+	}
+
 	token, expiresAt := tm.eksConfig.TokenCache.GetToken()
 
-	// 如果 token 在10分钟内过期，则刷新
+	// 如果token在10分钟内过期，则刷新
 	refreshThreshold := time.Now().Add(10 * time.Minute)
 	if token == "" || expiresAt.Before(refreshThreshold) {
 		klog.V(3).Infof("Token will expire soon, refreshing...")
@@ -161,23 +227,34 @@ func (tm *TokenManager) TriggerRefresh() {
 
 // Stop 停止自动刷新
 func (tm *TokenManager) Stop() {
+	if tm.autoRefreshStop != nil {
+		tm.autoRefreshStop()
+	}
 	close(tm.stopChan)
 }
 
-// GetTokenInfo 获取 token 信息
+// GetTokenInfo 获取token信息
 func (tm *TokenManager) GetTokenInfo() (token string, expiresAt time.Time, valid bool) {
+	if tm.eksConfig.TokenCache == nil {
+		return "", time.Time{}, false
+	}
 	token, expiresAt = tm.eksConfig.TokenCache.GetToken()
 	valid = tm.eksConfig.TokenCache.IsValid()
 	return
 }
 
-// ValidateAWSCredentials 验证 AWS 凭证
+// ValidateAWSCredentials 验证AWS凭证
 func (tm *TokenManager) ValidateAWSCredentials(ctx context.Context) error {
+	if tm.tokenProvider != nil {
+		// SDK模式：使用Token Provider验证
+		return tm.tokenProvider.ValidateCluster(ctx)
+	}
+
+	// Exec模式：使用STS客户端验证
 	if tm.stsClient == nil {
 		return NewEKSAuthError(ErrorTypeAWSConfigMissing, "STS client not initialized", nil)
 	}
 
-	// 调用 GetCallerIdentity 验证凭证
 	_, err := tm.stsClient.GetCallerIdentity(ctx, &sts.GetCallerIdentityInput{})
 	if err != nil {
 		return NewEKSAuthError(ErrorTypePermissionDenied, "AWS credentials validation failed", err)
@@ -187,7 +264,7 @@ func (tm *TokenManager) ValidateAWSCredentials(ctx context.Context) error {
 	return nil
 }
 
-// GetCallerIdentity 获取当前 AWS 身份信息
+// GetCallerIdentity 获取当前AWS身份信息
 func (tm *TokenManager) GetCallerIdentity(ctx context.Context) (*sts.GetCallerIdentityOutput, error) {
 	if tm.stsClient == nil {
 		return nil, NewEKSAuthError(ErrorTypeAWSConfigMissing, "STS client not initialized", nil)
@@ -196,7 +273,7 @@ func (tm *TokenManager) GetCallerIdentity(ctx context.Context) (*sts.GetCallerId
 	return tm.stsClient.GetCallerIdentity(ctx, &sts.GetCallerIdentityInput{})
 }
 
-// AssumeRole 承担 IAM 角色（如果配置了）
+// AssumeRole 承担IAM角色（如果配置了）
 func (tm *TokenManager) AssumeRole(ctx context.Context) error {
 	if tm.eksConfig.RoleARN == "" {
 		// 没有配置角色，跳过
@@ -209,7 +286,11 @@ func (tm *TokenManager) AssumeRole(ctx context.Context) error {
 
 	klog.V(2).Infof("Assuming role: %s", tm.eksConfig.RoleARN)
 
-	sessionName := fmt.Sprintf("kom-eks-%d", time.Now().Unix())
+	sessionName := tm.eksConfig.SessionName
+	if sessionName == "" {
+		sessionName = fmt.Sprintf("kom-eks-%d", time.Now().Unix())
+	}
+
 	result, err := tm.stsClient.AssumeRole(ctx, &sts.AssumeRoleInput{
 		RoleArn:         &tm.eksConfig.RoleARN,
 		RoleSessionName: &sessionName,
@@ -219,7 +300,7 @@ func (tm *TokenManager) AssumeRole(ctx context.Context) error {
 			fmt.Sprintf("failed to assume role %s", tm.eksConfig.RoleARN), err)
 	}
 
-	// 更新 AWS 配置使用临时凭证
+	// 更新AWS配置使用临时凭证
 	tm.awsConfig.Credentials = aws.NewCredentialsCache(aws.CredentialsProviderFunc(func(ctx context.Context) (aws.Credentials, error) {
 		return aws.Credentials{
 			AccessKeyID:     *result.Credentials.AccessKeyId,
@@ -233,8 +314,55 @@ func (tm *TokenManager) AssumeRole(ctx context.Context) error {
 	return nil
 }
 
-// ClearCache 清理 token 缓存
+// ClearCache 清理token缓存
 func (tm *TokenManager) ClearCache() {
-	tm.eksConfig.TokenCache.ClearToken()
+	if tm.eksConfig.TokenCache != nil {
+		tm.eksConfig.TokenCache.ClearToken()
+	}
 	klog.V(2).Infof("Cleared AWS token cache")
+}
+
+// IsUsingSDK 检查是否使用SDK模式
+func (tm *TokenManager) IsUsingSDK() bool {
+	return tm.tokenProvider != nil
+}
+
+// IsUsingExec 检查是否使用Exec模式
+func (tm *TokenManager) IsUsingExec() bool {
+	return tm.executor != nil
+}
+
+// GetProviderInfo 获取提供者信息
+func (tm *TokenManager) GetProviderInfo() string {
+	if tm.tokenProvider != nil {
+		return fmt.Sprintf("SDK: %s", tm.tokenProvider.String())
+	}
+	if tm.executor != nil {
+		return "Exec: AWS CLI"
+	}
+	return "None"
+}
+
+// initAWSConfig 初始化AWS配置
+func (tm *TokenManager) initAWSConfig(ctx context.Context) error {
+	var opts []func(*config.LoadOptions) error
+
+	// 设置区域
+	if tm.eksConfig.Region != "" {
+		opts = append(opts, config.WithRegion(tm.eksConfig.Region))
+	}
+
+	awsConfig, err := config.LoadDefaultConfig(ctx, opts...)
+	if err != nil {
+		return NewEKSAuthError(ErrorTypeAWSConfigMissing, "failed to load AWS config", err)
+	}
+
+	tm.awsConfig = awsConfig
+	tm.stsClient = sts.NewFromConfig(awsConfig)
+
+	// 保存到EKS配置中
+	tm.eksConfig.AWSConfig = &awsConfig
+
+	klog.V(2).Infof("Initialized AWS config with region: %s", awsConfig.Region)
+	return nil
 }
